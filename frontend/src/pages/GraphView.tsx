@@ -126,11 +126,17 @@ export default function GraphView() {
   }, [subgraph, cy])
   
   function handleZoomIn() {
-    cy?.zoom({ level: cy.zoom() * 1.2 })
+    if (cy) {
+      const currentZoom = cy.zoom()
+      cy.zoom(currentZoom * 1.2)
+    }
   }
   
   function handleZoomOut() {
-    cy?.zoom({ level: cy.zoom() * 0.8 })
+    if (cy) {
+      const currentZoom = cy.zoom()
+      cy.zoom(currentZoom * 0.8)
+    }
   }
   
   function handleFit() {

@@ -20,6 +20,9 @@ export default function SearchPage() {
   })
   const [isSearching, setIsSearching] = useState(false)
   
+  // Note: isSearching state could be used for loading indicators in the future
+  void isSearching; // Suppress unused warning for now
+  
   const searchParams: SearchQuery | null = query.trim() ? {
     query: query.trim(),
     repo_id: filters.repo_id,
