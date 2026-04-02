@@ -1,0 +1,199 @@
+version: '3.8'
+
+services:
+  # PostgreSQL with pgvector extension
+  postgres:
+    image: ankane/pgvector:latest
+    container_name: gitnexus-postgres
+    environment:
+      POSTGRES_USER: gitnexus
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gitnexus_secret}
+      POSTGRES_DB: gitnexus
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gitnexus"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gitnexus-network
+
+  # Neo4j graph database
+  neo4j:
+    image: neo4j:5-community
+    container_name: gitnexus-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-gitnexus_graph}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_memory_heap_max__size: 2G
+      NEO4J_dbms_memory_pagecache_size: 1G
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    ports:
+      - "127.0.0.1:7474:7474"  # HTTP
+      - "127.0.0.1:7687:7687"  # Bolt
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD:-gitnexus_graph}", "RETURN 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - gitnexus-network
+
+  # Redis for job queue and caching
+  redis:
+    image: redis:7-alpine
+    container_name: gitnexus-redis
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    networks:
+      - gitnexus-network
+
+  # Backend API server
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: gitnexus-api
+    environment:
+      - DATABASE_URL=postgresql://gitnexus:${POSTGRES_PASSWORD:-gitnexus_secret}@postgres:5432/gitnexus
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-gitnexus_graph}
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-change_me_in_production}
+      - DEBUG=${DEBUG:-false}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-jina-embeddings-v2-base-code}
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-local}  # local, openai, or custom
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    volumes:
+      - repo_mirrors:/app/repos
+      - model_cache:/app/models
+      - ./backend:/app  # Dev mode: mount source
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - gitnexus-network
+
+  # Background indexer worker
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    container_name: gitnexus-worker
+    environment:
+      - DATABASE_URL=postgresql://gitnexus:${POSTGRES_PASSWORD:-gitnexus_secret}@postgres:5432/gitnexus
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-gitnexus_graph}
+      - REDIS_URL=redis://redis:6379/0
+      - REPO_MIRROR_PATH=/app/repos
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-jina-embeddings-v2-base-code}
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-local}
+      - MAX_WORKERS=${MAX_WORKERS:-2}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+    volumes:
+      - repo_mirrors:/app/repos
+      - model_cache:/app/models
+      - ./backend:/app  # Dev mode: mount source
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: python -m worker.main
+    networks:
+      - gitnexus-network
+    deploy:
+      replicas: ${WORKER_REPLICAS:-1}
+
+  # MCP Gateway server
+  mcp:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: gitnexus-mcp
+    environment:
+      - DATABASE_URL=postgresql://gitnexus:${POSTGRES_PASSWORD:-gitnexus_secret}@postgres:5432/gitnexus
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-gitnexus_graph}
+      - API_BASE_URL=http://api:8000
+      - MCP_TRANSPORT=${MCP_TRANSPORT:-sse}  # sse or stdio
+    ports:
+      - "127.0.0.1:8001:8000"
+    depends_on:
+      - api
+    command: python -m mcp_server.main
+    networks:
+      - gitnexus-network
+
+  # Frontend React app
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: gitnexus-frontend
+    environment:
+      - VITE_API_URL=http://localhost:8000
+      - VITE_MCP_URL=http://localhost:8001
+    ports:
+      - "127.0.0.1:3000:80"
+    depends_on:
+      - api
+    networks:
+      - gitnexus-network
+
+  # Nginx reverse proxy (optional, for production)
+  nginx:
+    image: nginx:alpine
+    container_name: gitnexus-nginx
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - frontend
+      - api
+      - mcp
+    networks:
+      - gitnexus-network
+    profiles:
+      - production
+
+volumes:
+  postgres_data:
+    driver: local
+  neo4j_data:
+    driver: local
+  neo4j_logs:
+    driver: local
+  redis_data:
+    driver: local
+  repo_mirrors:
+    driver: local
+  model_cache:
+    driver: local
+
+networks:
+  gitnexus-network:
+    driver: bridge
